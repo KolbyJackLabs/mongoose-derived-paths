@@ -1,0 +1,4 @@
+{
+  "extends": "./tsconfig.json",
+  "files": ["esm.mts", "cjs.cts", "schema-create.mts"]
+}

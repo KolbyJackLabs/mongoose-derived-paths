@@ -1,0 +1,62 @@
+{
+  "name": "mongoose-derived-paths",
+  "version": "0.1.0",
+  "description": "Mongoose plugin: declare a field's value as a function of other fields and keep it stored and in sync as they change",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.mts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup",
+    "build:watch": "tsup --watch",
+    "prepublishOnly": "npm run build && npm test && npm run test:types",
+    "release:major": "node scripts/release.mjs major",
+    "release:minor": "node scripts/release.mjs minor",
+    "release:patch": "node scripts/release.mjs patch",
+    "test": "vitest run",
+    "test:types": "node scripts/test-types.mjs",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "mongoose",
+    "plugin",
+    "derived",
+    "computed",
+    "calculated",
+    "totals"
+  ],
+  "author": "KolbyJackLabs",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KolbyJackLabs/mongoose-derived-paths.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "mongoose": "^7.0.0 || ^8.0.0 || ^9.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "mongoose": "^9.3.0",
+    "tsup": "^8.3.5",
+    "typescript": "^5.5.4",
+    "vitest": "^4.1.12"
+  }
+}
