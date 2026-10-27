@@ -52,7 +52,7 @@ export function derivedPath<Source extends string>(schema: Schema, { compute, so
     if (!isDocument(this)) {
       throw new Error(`[mongoose-derived-paths] ${describe} and can't be set by a query update. Change its sources on the document and save() it instead.`);
     }
-    console.warn(`[mongoose-derived-paths] ${describe}; the manual set was ignored. Set its sources instead.`);
+    console.warn(`[mongoose-derived-paths] ${describe}; the manual set was ignored. Set its sources instead.${callerFrames()}`);
     const doc = climb(this, targetDepth);
     // Subdocument not attached yet; keep the prior value and let pre("validate") derive it
     if (!doc) return priorVal;
@@ -115,6 +115,26 @@ export default derivedPaths;
 
 // Structural so validate hooks' loosely typed `this` (any Document generic) fits
 type DocumentLike = { $set(path: string, value: unknown): unknown; get(path: string): unknown };
+
+// Mongoose and Node internals sit between the assignment and the setter
+const INTERNAL_FRAME = /[\\/]node_modules[\\/]mongoose[\\/]|\(node:|^\s*at node:/;
+const FRAME_FILE = /\(?((?:file:\/\/)?[^():]+(?::\\[^():]+)?):\d+:\d+\)?$/;
+
+// Where the manual set happened, so the warning points at the caller rather than at this package. Several frames,
+// because wrappers that patch Document#$set (sync/audit plugins) sit between the caller and Mongoose
+const CALLER_FRAMES = 3;
+function callerFrames() {
+  const limit = Error.stackTraceLimit;
+  // Mongoose's setter chain alone can exceed the default 10 frames
+  Error.stackTraceLimit = 50;
+  const stack = new Error().stack ?? "";
+  Error.stackTraceLimit = limit;
+  const frames = stack.split("\n").filter((line) => line.trim().startsWith("at "));
+  // The first frame is this function, so its file is this module, whether built, linked or installed
+  const ownFile = frames[0]?.match(FRAME_FILE)?.[1];
+  const callers = frames.filter((line) => !INTERNAL_FRAME.test(line) && (!ownFile || !line.includes(ownFile))).slice(0, CALLER_FRAMES);
+  return callers.map((line) => `\n    ${line.trim()}`).join("");
+}
 
 function isDocument(value: unknown): value is Document {
   return typeof (value as Document | undefined)?.$set === "function";

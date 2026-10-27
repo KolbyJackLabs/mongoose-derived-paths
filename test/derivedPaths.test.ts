@@ -106,7 +106,7 @@ describe("manual sets", () => {
     doc.summary.claims.total = 99;
     expect(doc.summary.claims.total).toBe(2);
     expect(warn).toHaveBeenCalledOnce();
-    expect(warn.mock.calls[0][0]).toMatch(/"total" is derived from "refund", "reorder"; the manual set was ignored/);
+    expect(warn.mock.calls[0][0]).toMatch(/"total" is derived from "refund", "reorder"; the manual set was ignored\. Set its sources instead\.\n {4}at .*derivedPaths\.test\.ts:\d+:\d+/);
   });
 
   it("ignores the target in constructor input", () => {
