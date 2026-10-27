@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import mongoose, { Schema } from "mongoose";
 import derivedPaths, { derivedPath } from "../src/index";
 
@@ -82,6 +82,50 @@ describe("derivedPath", () => {
     expect(() => schema.plugin(derivedPath, { compute: add, sources: ["missing"], target: "total" })).toThrow(/unknown source/);
     expect(() => schema.plugin(derivedPath, { compute: add, sources: ["a"], target: "missing" })).toThrow(/unknown target/);
     expect(() => schema.plugin(derivedPath, { compute: add, sources: ["a", "total"], target: "total" })).toThrow(/cannot also be a source/);
+  });
+});
+
+describe("manual sets", () => {
+  let warn: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+  afterEach(() => warn.mockRestore());
+
+  it("stays quiet for defaults, source assignments, chained writes, validate and hydrate", async () => {
+    const Model = claimsModel();
+    const doc: any = new Model({ summary: { claims: { refund: 1 } } });
+    doc.summary.claims.reorder = 2;
+    await doc.validate();
+    Model.hydrate({ summary: { claims: { refund: 1, total: 1 } } });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("ignores an assignment to the target, keeps the derived value, and warns", () => {
+    const doc: any = new (claimsModel())({ summary: { claims: { refund: 2 } } });
+    doc.summary.claims.total = 99;
+    expect(doc.summary.claims.total).toBe(2);
+    expect(warn).toHaveBeenCalledOnce();
+    expect(warn.mock.calls[0][0]).toMatch(/"total" is derived from "refund", "reorder"; the manual set was ignored/);
+  });
+
+  it("ignores the target in constructor input", () => {
+    const doc: any = new (claimsModel())({ summary: { claims: { refund: 1, total: 50 } } });
+    expect(doc.summary.claims.total).toBe(1);
+    expect(warn).toHaveBeenCalledOnce();
+  });
+
+  it("ignores doc.set on a nested derived path", () => {
+    const doc: any = new (claimsModel())({ summary: { claims: { refund: 3 } } });
+    doc.set("summary.claims.total", 99);
+    expect(doc.summary.claims.total).toBe(3);
+  });
+
+  it("fails a query update that sets the target instead of writing it", () => {
+    const Model = claimsModel();
+    // Setters run when the update is cast at exec time; cast it directly so no connection is needed
+    const query: any = Model.updateOne({}, { $set: { "summary.claims.total": 5 } });
+    expect(() => query._castUpdate(query.getUpdate())).toThrow(/can't be set by a query update/);
   });
 });
 

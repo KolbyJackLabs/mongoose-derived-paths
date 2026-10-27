@@ -31,8 +31,35 @@ export function derivedPath<Source extends string>(schema: Schema, { compute, so
     for (const s of sources) {
       values[s] = s === override?.source ? override.value : doc.get(s);
     }
-    doc.$set(target, compute(values));
+    const value = compute(values);
+    computing++;
+    try {
+      doc.$set(target, value);
+    } finally {
+      computing--;
+    }
   };
+
+  const targetDepth = singleNestedDepth(schema, target);
+  const describe = `"${target}" is derived from ${sources.map((s) => `"${s}"`).join(", ")}`;
+
+  // Only derivedPath writes a derived path: manual document assignments are replaced with the derived value, and
+  // query updates that set it fail, since a setter can't drop a key from an update
+  schema.path(target).set(function (this: unknown, value: unknown, priorVal: unknown, _schemaType: unknown, options?: { _skipMarkModified?: boolean }) {
+    // Mongoose applies defaults through setters with `_skipMarkModified`; those aren't manual sets
+    if (computing || options?._skipMarkModified) return value;
+
+    if (!isDocument(this)) {
+      throw new Error(`[mongoose-derived-paths] ${describe} and can't be set by a query update. Change its sources on the document and save() it instead.`);
+    }
+    console.warn(`[mongoose-derived-paths] ${describe}; the manual set was ignored. Set its sources instead.`);
+    const doc = climb(this, targetDepth);
+    // Subdocument not attached yet; keep the prior value and let pre("validate") derive it
+    if (!doc) return priorVal;
+    const values = {} as Record<Source, unknown>;
+    for (const s of sources) values[s] = doc.get(s);
+    return compute(values);
+  });
 
   for (const source of sources) {
     const schemaType = schema.path(source);
@@ -57,6 +84,9 @@ export function derivedPath<Source extends string>(schema: Schema, { compute, so
     recompute(this);
   });
 }
+
+// Nonzero while derivedPath writes a target, so the target's warning setter can tell its own writes from a developer's
+let computing = 0;
 
 const derivedPathsApplied = new WeakSet<Schema>();
 

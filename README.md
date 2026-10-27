@@ -111,11 +111,20 @@ statementSchema.plugin(derivedPath, {
 | `new Model({ ... })` | ✓ |
 | `doc.validate()` / `doc.save()` | ✓ (`pre("validate")`, so constructor key order can't leave a value stale) |
 | Loaded from the database / `Model.hydrate()` | ✗ — the stored value is kept |
-| `updateOne`, `findOneAndUpdate`, other query updates | ✗ — update the target yourself |
+| `updateOne`, `findOneAndUpdate`, other query updates | ✗ — and setting the derived path itself fails the query |
 
 `compute` receives the **cast** value of the path being assigned (e.g. `"7"` assigned to a `Number` path arrives as `7`).
 
 Targets marked `immutable: true` only change while the document is new: once saved, the stored value is kept even if a source changes.
+
+### Derived paths can't be set manually
+
+Only the plugin writes a derived path.
+
+- **Documents:** `doc.total = 5`, `doc.set("total", 5)` and constructor input that includes it are ignored. The path keeps its derived value and a `console.warn` names the path and its sources.
+- **Query updates** (`updateOne`, `findOneAndUpdate`, …) that `$set` a derived path fail with an error, since a setter can't drop a key from an update. Change the sources on the document and `save()` it instead.
+
+Defaults and the plugin's own writes are not manual sets.
 
 ---
 
