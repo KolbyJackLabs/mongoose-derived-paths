@@ -86,9 +86,58 @@ statement.claims.total; // 30
 statement.net; // 70
 ```
 
+### Parent paths: `$root.`
+
+A subschema field can derive from paths on the document `derivedPaths` is applied to by prefixing them with `$root.`. `compute` receives the keys as written, and plain sources stay relative to the subschema:
+
+```javascript
+const periodTotalSchema = new Schema(
+  {
+    rate: Number,
+    total: {
+      type: Number,
+      derived: {
+        sources: ["$root.summary.collected", "$root.summary.claims"],
+        compute: (v) => Number(v["$root.summary.collected"] ?? 0) - Number(v["$root.summary.claims"] ?? 0),
+      },
+    },
+    totalUSD: { type: Number, derived: { sources: ["rate", "total"], compute: (v) => Number(v.total ?? 0) * Number(v.rate ?? 1) } },
+  },
+  { _id: false }
+);
+
+statementSchema.add({ periodTotal: { type: periodTotalSchema, default: {} } });
+statementSchema.plugin(derivedPaths);
+```
+
+`$root.` sources aren't supported for fields inside document arrays.
+
+### Document arrays
+
+A source that goes through a document array gives `compute` one value per element:
+
+```javascript
+const orderSchema = new Schema({
+  items: [new Schema({ price: Number }, { _id: false })],
+  total: {
+    type: Number,
+    default: 0,
+    derived: { sources: ["items.price"], compute: (v) => (v["items.price"] ?? []).reduce((sum, p) => sum + Number(p ?? 0), 0) },
+  },
+});
+orderSchema.plugin(derivedPaths);
+
+order.items[0].price = 5; // recomputes total
+order.items.push({ price: 3 }); // doesn't (no setter runs) — call refreshDerived(order) or validate
+```
+
+Assigning an element's field, or replacing the whole array, recomputes immediately. `push`, `splice`, `pull` and other in-place array changes don't run setters; they're picked up on validate, or right away with `refreshDerived(doc)`.
+
+Embedded discriminators declared with a path's `discriminators` option are wired too, so each discriminated type can declare its own derived fields.
+
 ### Explicit: `derivedPath`
 
-When the target lives in a subschema but its sources live on the parent, a field-level option can't reach them. Register it on the parent instead:
+`derivedPaths` reads `derived` field options. To wire a single path without a field option, call `derivedPath` with the target and sources relative to the schema you apply it to:
 
 ```javascript
 import { derivedPath } from "mongoose-derived-paths";
@@ -109,7 +158,10 @@ statementSchema.plugin(derivedPath, {
 | `doc.source = value` | ✓ |
 | `doc.set("nested.source", value)` | ✓ |
 | `new Model({ ... })` | ✓ |
+| Element field of a document array source / replacing the array | ✓ |
+| `push`, `splice`, `pull` on a document array source | ✗ until validate or `refreshDerived(doc)` |
 | `doc.validate()` / `doc.save()` | ✓ (`pre("validate")`, so constructor key order can't leave a value stale) |
+| `refreshDerived(doc)` | ✓ (the document and all its subdocuments) |
 | Loaded from the database / `Model.hydrate()` | ✗ — the stored value is kept |
 | `updateOne`, `findOneAndUpdate`, other query updates | ✗ — and setting the derived path itself fails the query |
 
@@ -132,11 +184,15 @@ Defaults and the plugin's own writes are not manual sets.
 
 ### `derivedPaths(schema)` (default export)
 
-Schema plugin. Wires every field with a `derived` option in `schema` and its nested subschemas. Safe to apply more than once.
+Schema plugin. Wires every field with a `derived` option in `schema`, its nested subschemas and their embedded discriminators. `$root.` sources resolve from `schema`. Safe to apply more than once.
 
 ### `derivedPath(schema, { target, sources, compute })`
 
 Schema plugin. Recomputes `target` whenever a path in `sources` is assigned, and in `pre("validate")`. Throws at setup if a path doesn't exist or `target` is listed in `sources`.
+
+### `refreshDerived(doc)`
+
+Recomputes every derived path on `doc` and its subdocuments now, deepest first. Use it after in-place array changes when you need fresh values before validate (for example in another `pre("validate")` hook that reads them). Values that aren't Mongoose documents are ignored.
 
 ### Types
 

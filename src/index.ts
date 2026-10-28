@@ -14,8 +14,11 @@ export type DerivedFieldOption<Source extends string = string> = Omit<DerivedPat
 
 /**
  * Schema plugin: whenever a source path is assigned on a document, recompute `target` from all sources.
- * Sources may sit inside single-nested subdocuments (`summary.claims.total`); assigning them recomputes on the
+ * Sources may sit inside single-nested subdocuments (`summary.claims.total`) or document arrays
+ * (`items.price`, which `compute` receives as an array with one value per element); assigning them recomputes on the
  * document this schema belongs to. Targets can be sources of other derived paths, so values chain.
+ * Array mutations (`push`, `splice`, `pull`, reassigning the array) don't run setters; they recompute on validate or
+ * `refreshDerived(doc)`.
  * Also recomputes in `pre("validate")`, so constructor key order or a late subdocument can't leave `target` stale.
  * Hydrating from the database and query updates (`updateOne`, `findOneAndUpdate`) do not recompute; `immutable`
  * targets only change while the document is new.
@@ -23,14 +26,31 @@ export type DerivedFieldOption<Source extends string = string> = Omit<DerivedPat
  * schema.plugin(derivedPath, { compute: ({ a, b }) => Number(a ?? 0) + Number(b ?? 0), sources: ["a", "b"], target: "total" });
  */
 export function derivedPath<Source extends string>(schema: Schema, { compute, sources, target }: DerivedPathOptions<Source>) {
-  if (!schema.path(target)) throw new Error(`derivedPath: unknown target path "${target}"`);
+  const targetType = resolvePath(schema, target)?.schemaType;
+  if (!targetType) throw new Error(`derivedPath: unknown target path "${target}"`);
   if (sources.includes(target as Source)) throw new Error(`derivedPath: target "${target}" cannot also be a source`);
+  // Validate every source before wiring anything, so a bad call leaves the schema untouched
+  const resolvedSources = sources.map((source) => {
+    const resolved = resolvePath(schema, source);
+    if (!resolved) throw new Error(`derivedPath: unknown source path "${source}"`);
+    return { resolved, source };
+  });
+  // Schema clones (discriminators) copy setters and hooks; a target that already has its guard is fully wired
+  if (hasSetter(targetType, `target:${target}`)) return;
 
-  const recompute = (doc: DocumentLike, override?: { source: Source; value: unknown }) => {
+  const readSources = (doc: DocumentLike, override?: Override<Source>) => {
     const values = {} as Record<Source, unknown>;
     for (const s of sources) {
-      values[s] = s === override?.source ? override.value : doc.get(s);
+      values[s] = collect(doc, s.split("."), s === override?.source ? override : undefined);
     }
+    return values;
+  };
+
+  const recompute = (doc: DocumentLike, override?: Override<Source>) => {
+    const values = readSources(doc, override);
+    // The setter's document or element isn't reachable from `doc` yet (an array element cast before the array is
+    // stored); the container's own setter or pre("validate") derives the value once it is
+    if (override && !override.used) return;
     const value = compute(values);
     computing++;
     try {
@@ -40,12 +60,12 @@ export function derivedPath<Source extends string>(schema: Schema, { compute, so
     }
   };
 
-  const targetDepth = singleNestedDepth(schema, target);
+  const targetDepth = resolvePath(schema, target)?.depth ?? 0;
   const describe = `"${target}" is derived from ${sources.map((s) => `"${s}"`).join(", ")}`;
 
   // Only derivedPath writes a derived path: manual document assignments are replaced with the derived value, and
   // query updates that set it fail, since a setter can't drop a key from an update
-  schema.path(target).set(function (this: unknown, value: unknown, priorVal: unknown, _schemaType: unknown, options?: { _skipMarkModified?: boolean }) {
+  addSetter(targetType, `target:${target}`, function (this: unknown, value: unknown, priorVal: unknown, _schemaType: unknown, options?: { _skipMarkModified?: boolean }) {
     // Mongoose applies defaults through setters with `_skipMarkModified`; those aren't manual sets
     if (computing || options?._skipMarkModified) return value;
 
@@ -56,59 +76,160 @@ export function derivedPath<Source extends string>(schema: Schema, { compute, so
     const doc = climb(this, targetDepth);
     // Subdocument not attached yet; keep the prior value and let pre("validate") derive it
     if (!doc) return priorVal;
-    const values = {} as Record<Source, unknown>;
-    for (const s of sources) values[s] = doc.get(s);
-    return compute(values);
+    return compute(readSources(doc as DocumentLike));
   });
 
-  for (const source of sources) {
-    const schemaType = schema.path(source);
-    if (!schemaType) throw new Error(`derivedPath: unknown source path "${source}"`);
-    const depth = singleNestedDepth(schema, source);
+  for (const { resolved, source } of resolvedSources) {
+    // The leaf and every subdocument/array on the way to it: replacing any of them changes the source's value
+    for (const { depth, index, schemaType } of resolved.steps) {
+      addSetter(schemaType, `source:${target}:${source}:${index}`, function (this: unknown, value: unknown) {
+        // Setters also run on query updates, where `this` is the Query; only documents can recompute
+        if (!isDocument(this)) return value;
+        // A nested path's setter runs on its own subdocument or array element; climb back to this schema's document
+        const doc = climb(this, depth);
+        // Subdocument not attached yet (defaults while building); pre("validate") catches up
+        if (!doc) return value;
 
-    schemaType.set(function (this: unknown, value: unknown) {
-      // Setters also run on query updates, where `this` is the Query; only documents can recompute
-      if (!isDocument(this)) return value;
-      // A nested source's setter runs on its own subdocument; climb back to this schema's document
-      const doc = climb(this, depth);
-      // Subdocument not attached yet (defaults while building); pre("validate") catches up
-      if (!doc) return value;
-
-      // Setters run before the value is stored, so pass the incoming value for the path being set
-      recompute(doc, { source, value: castOrRaw(schemaType, value, this) });
-      return value;
-    });
+        // Setters run before the value is stored, so read the incoming (cast) value in place of the stored one
+        recompute(doc as DocumentLike, { index, owner: this, source, value: castOrRaw(schemaType, value, this) });
+        return value;
+      });
+    }
   }
 
   schema.pre("validate", function () {
     recompute(this);
   });
+  // Lets refreshDerived() rerun this recompute on demand; hooks survive schema clones made by discriminators
+  // Mongoose's types only list built-in hook names; Kareem runs any name
+  (schema as unknown as { pre(name: string, fn: (this: DocumentLike) => void): void }).pre(REFRESH_HOOK, function () {
+    recompute(this);
+  });
+}
+
+const REFRESH_HOOK = "mongoose-derived-paths:refresh";
+
+/**
+ * Recompute every derived path on `doc` and its subdocuments now, deepest first. Use it after array mutations
+ * (`push`, `splice`, `pull`) when you need fresh values before validate, e.g. in another `pre("validate")` hook
+ * that reads them. Anything that isn't a Mongoose document is ignored.
+ */
+export function refreshDerived(doc: Document) {
+  // Not a Mongoose document (a plain object or a test double): nothing is wired, so there's nothing to derive
+  if (typeof (doc as Partial<Document & { $getAllSubdocs: unknown }>)?.$getAllSubdocs !== "function") return;
+  const subdocs = (doc as Document & { $getAllSubdocs(): Document[] }).$getAllSubdocs();
+  const byDepth = subdocs.map((sub) => ({ depth: depthOf(sub), sub })).sort((a, b) => b.depth - a.depth);
+  for (const { sub } of byDepth) runRefresh(sub);
+  runRefresh(doc);
+}
+
+function runRefresh(doc: Document) {
+  const schema = (doc as Document & { $__schema?: Schema }).$__schema ?? doc.schema;
+  (schema as Schema & { s: { hooks: { execPreSync(name: string, context: unknown, args: unknown[]): unknown } } }).s.hooks.execPreSync(REFRESH_HOOK, doc, []);
+}
+
+function depthOf(doc: Document) {
+  let depth = 0;
+  let current = doc;
+  for (;;) {
+    // A top-level document is its own $parent()
+    const parent = (current as Document & { $parent(): Document | undefined }).$parent();
+    if (!parent || parent === current) return depth;
+    current = parent;
+    depth++;
+  }
 }
 
 // Nonzero while derivedPath writes a target, so the target's warning setter can tell its own writes from a developer's
 let computing = 0;
 
-const derivedPathsApplied = new WeakSet<Schema>();
+const ROOT = "$root.";
 
 /**
  * Schema plugin: wires every field declared with a `derived` option through `derivedPath`, in this schema and
- * every nested subschema, so the formula lives on the field it fills. Apply once on the outermost schema.
- * Sources are relative to the schema the field is declared in.
+ * every nested subschema (including embedded discriminators declared with a path's `discriminators` option), so the
+ * formula lives on the field it fills. Apply once on the outermost schema.
+ * Sources are relative to the schema the field is declared in. A source starting with `$root.` is relative to the
+ * schema this plugin is applied to instead, so a subschema field can derive from its parent's paths
+ * (`"$root.summary.claims.total"`); `compute` receives the keys as written. `$root.` sources can't be used inside
+ * document arrays.
  * @example
  * const schema = new Schema({ a: Number, b: Number,
  *   total: { type: Number, derived: { sources: ["a", "b"], compute: ({ a, b }) => Number(a ?? 0) + Number(b ?? 0) } } });
  * schema.plugin(derivedPaths);
  */
 export function derivedPaths(schema: Schema) {
-  // Subschemas shared by several parents must not get their setters registered twice
-  if (derivedPathsApplied.has(schema)) return;
-  derivedPathsApplied.add(schema);
+  walk(schema, schema, "", false, new Set());
 
-  schema.eachPath((target, schemaType) => {
-    const derived = (schemaType.options as { derived?: DerivedFieldOption }).derived;
-    if (derived) derivedPath(schema, { ...derived, target });
+  // Compiling a model rebuilds embedded discriminator schemas without the setters wired above (their `derived`
+  // options survive), so wire the compiled ones too. Setters are tagged, so already-wired paths are skipped
+  schema.on("init", (model: { schema: Schema }) => wireCompiled(model.schema, new Set()));
+}
+
+// Visits `schema` (found at `prefix` under `root`) and its subdocument and array schemas, wiring `derived` fields.
+// Re-wiring is a no-op (tagged setters), so subschemas shared by several parents are safe
+function walk(schema: Schema, root: Schema, prefix: string, inArray: boolean, seen: Set<Schema>) {
+  if (seen.has(schema)) return;
+  seen.add(schema);
+  schema.eachPath((path, schemaType) => {
+    const { derived, discriminators } = schemaType.options as { derived?: DerivedFieldOption; discriminators?: Record<string, Schema> };
+    if (derived) wireField(schema, root, prefix, inArray, path, derived);
+
+    const container = schemaType as ContainerSchemaType;
+    if (!container.schema || !(container.$isSingleNested || container.$isMongooseDocumentArray)) return;
+    const childInArray = inArray || Boolean(container.$isMongooseDocumentArray);
+    walk(container.schema, root, `${prefix}${path}.`, childInArray, seen);
+    // Embedded discriminators declared on the path aren't child schemas until the model compiles
+    for (const discriminator of Object.values(discriminators ?? {})) walk(discriminator, root, `${prefix}${path}.`, childInArray, seen);
   });
-  for (const { schema: child } of schema.childSchemas) derivedPaths(child);
+}
+
+function wireField(schema: Schema, root: Schema, prefix: string, inArray: boolean, target: string, derived: DerivedFieldOption) {
+  if (!derived.sources.some((source) => source.startsWith(ROOT))) {
+    derivedPath(schema, { ...derived, target });
+    return;
+  }
+  if (inArray) throw new Error(`derivedPaths: "${prefix}${target}" is inside a document array, where "${ROOT}" sources aren't supported`);
+
+  // Wire on the root, where every source resolves; hand `compute` the keys as the field declared them
+  const keys = derived.sources.map((source) => ({ declared: source, fromRoot: source.startsWith(ROOT) ? source.slice(ROOT.length) : `${prefix}${source}` }));
+  derivedPath(root, {
+    compute: (values) => derived.compute(Object.fromEntries(keys.map(({ declared, fromRoot }) => [declared, values[fromRoot]]))),
+    sources: keys.map(({ fromRoot }) => fromRoot),
+    target: `${prefix}${target}`,
+  });
+}
+
+function wireLocalFields(schema: Schema) {
+  schema.eachPath((target, schemaType) => {
+    const { derived } = schemaType.options as { derived?: DerivedFieldOption };
+    // `$root.` fields are wired on their root by derivedPaths, and those setters survive compilation
+    if (derived && !derived.sources.some((source) => source.startsWith(ROOT))) derivedPath(schema, { ...derived, target });
+  });
+}
+
+function wireCompiled(schema: Schema, seen: Set<Schema>) {
+  if (seen.has(schema)) return;
+  seen.add(schema);
+  wireLocalFields(schema);
+  schema.eachPath((_path, schemaType) => {
+    const nested = (schemaType as ContainerSchemaType).schema as (Schema & { discriminators?: Record<string, Schema> }) | undefined;
+    for (const discriminator of Object.values(nested?.discriminators ?? {})) wireCompiled(discriminator, seen);
+  });
+  for (const { schema: child } of schema.childSchemas) wireCompiled(child, seen);
+}
+
+const SETTER_KEY = Symbol.for("mongoose-derived-paths:setter");
+type TaggedSetter = ((...args: never[]) => unknown) & { [SETTER_KEY]?: string };
+
+function hasSetter(schemaType: SchemaType, key: string) {
+  return ((schemaType as SchemaType & { setters: TaggedSetter[] }).setters ?? []).some((setter) => setter[SETTER_KEY] === key);
+}
+
+function addSetter(schemaType: SchemaType, key: string, setter: TaggedSetter) {
+  if (hasSetter(schemaType, key)) return;
+  setter[SETTER_KEY] = key;
+  schemaType.set(setter as (value: unknown) => unknown);
 }
 
 export default derivedPaths;
@@ -123,6 +244,7 @@ const FRAME_FILE = /\(?((?:file:\/\/)?[^():]+(?::\\[^():]+)?):\d+:\d+\)?$/;
 // Where the manual set happened, so the warning points at the caller rather than at this package. Several frames,
 // because wrappers that patch Document#$set (sync/audit plugins) sit between the caller and Mongoose
 const CALLER_FRAMES = 3;
+const FRAME_LOCATION = /[^\s(]+:\d+:\d+(?=\)?$)/;
 function callerFrames() {
   const limit = Error.stackTraceLimit;
   // Mongoose's setter chain alone can exceed the default 10 frames
@@ -132,22 +254,63 @@ function callerFrames() {
   const frames = stack.split("\n").filter((line) => line.trim().startsWith("at "));
   // The first frame is this function, so its file is this module, whether built, linked or installed
   const ownFile = frames[0]?.match(FRAME_FILE)?.[1];
-  const callers = frames.filter((line) => !INTERNAL_FRAME.test(line) && (!ownFile || !line.includes(ownFile))).slice(0, CALLER_FRAMES);
-  return callers.map((line) => `\n    ${line.trim()}`).join("");
+  const callers = frames.filter((line) => !INTERNAL_FRAME.test(line) && (!ownFile || !line.includes(ownFile)));
+  // A $set wrapper re-enters once per nested subdocument; list each location once
+  const locations = [...new Map(callers.map((line) => [line.match(FRAME_LOCATION)?.[0] ?? line, line.trim()])).values()];
+  return locations
+    .slice(0, CALLER_FRAMES)
+    .map((line) => `\n    ${line}`)
+    .join("");
 }
 
 function isDocument(value: unknown): value is Document {
   return typeof (value as Document | undefined)?.$set === "function";
 }
 
-// Each single-nested hop in `path` is one `$parent()` between the source's subdocument and this schema's document
-function singleNestedDepth(schema: Schema, path: string) {
+type ContainerSchemaType = SchemaType & { $isSingleNested?: boolean; $isMongooseDocumentArray?: boolean; schema?: Schema };
+
+type ResolvedStep = { depth: number; index: number; schemaType: SchemaType };
+
+// Resolves `path` through single-nested subdocuments and document arrays. Each step is a path whose setter affects
+// the value (every container on the way, then the leaf): `depth` counts the subdocument hops from the document that
+// owns it back to this schema's document, and `index` is its last segment in `path`
+function resolvePath(schema: Schema, path: string): { depth: number; schemaType: SchemaType; steps: ResolvedStep[] } | undefined {
   const parts = path.split(".");
+  const steps: ResolvedStep[] = [];
+  let current = schema;
   let depth = 0;
-  for (let i = 1; i < parts.length; i++) {
-    if ((schema.path(parts.slice(0, i).join(".")) as (SchemaType & { $isSingleNested?: boolean }) | undefined)?.$isSingleNested) depth++;
+  let start = 0;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const container = current.path(parts.slice(start, i + 1).join(".")) as ContainerSchemaType | undefined;
+    if (container?.schema && (container.$isSingleNested || container.$isMongooseDocumentArray)) {
+      steps.push({ depth, index: i, schemaType: container });
+      current = container.schema;
+      depth++;
+      start = i + 1;
+    }
   }
-  return depth;
+  const schemaType = current.path(parts.slice(start).join("."));
+  if (!schemaType) return undefined;
+  steps.push({ depth, index: parts.length - 1, schemaType });
+  return { depth, schemaType, steps };
+}
+
+type Override<Source extends string = string> = { index: number; owner: unknown; source: Source; used?: boolean; value: unknown };
+
+// Reads `parts` from `node`, mapping over arrays so `items.price` yields one value per element. `override` swaps in
+// the incoming value at the path whose setter is running (on the document or element that owns it), since it isn't
+// stored yet
+function collect(node: unknown, parts: string[], override?: Override, index = 0): unknown {
+  if (node == null) return undefined;
+  if (Array.isArray(node)) return node.map((element) => collect(element, parts, override, index));
+  const overridden = override && node === override.owner && index === override.index;
+  if (overridden) override.used = true;
+  const next = overridden
+    ? override.value
+    : typeof (node as DocumentLike).get === "function"
+        ? (node as DocumentLike).get(parts[index])
+        : (node as Record<string, unknown>)[parts[index]];
+  return index === parts.length - 1 ? next : collect(next, parts, override, index + 1);
 }
 
 function climb(doc: Document, depth: number) {
