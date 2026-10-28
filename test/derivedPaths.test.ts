@@ -295,3 +295,172 @@ describe("$root sources", () => {
     expect(() => schema.plugin(derivedPaths)).toThrow(/inside a document array/);
   });
 });
+
+describe("$root sources inside the target's own container", () => {
+  // Like a statement summary: `summary.incentives.commission` derives from `$root.` paths that also live under `summary`
+  function summaryModel(summaryOptions: { default?: unknown } = { default: {} }) {
+    const incentivesSchema = new Schema(
+      {
+        commission: {
+          default: 0,
+          derived: {
+            compute: (v: Record<"$root.rate" | "$root.summary.claims.total" | "$root.summary.collected", unknown>) =>
+              (Number(v["$root.summary.collected"] ?? 0) - Number(v["$root.summary.claims.total"] ?? 0)) * Number(v["$root.rate"] ?? 0),
+            sources: ["$root.rate", "$root.summary.claims.total", "$root.summary.collected"],
+          },
+          type: Number,
+        },
+      },
+      { _id: false }
+    );
+    const claimsSchema = new Schema({ refund: Number, total: { default: 0, derived: { compute: add, sources: ["refund"] }, immutable: true, type: Number } }, { _id: false });
+    const summarySchema = new Schema(
+      { claims: { default: {}, type: claimsSchema }, collected: Number, incentives: { default: {}, type: incentivesSchema } },
+      { _id: false }
+    );
+    const schema = new Schema({ rate: Number, summary: { ...summaryOptions, type: summarySchema } });
+    schema.plugin(derivedPaths);
+    return uniqueModel(schema);
+  }
+
+  const input = { rate: 0.5, summary: { claims: { refund: 20 }, collected: 100 } };
+
+  for (const [label, options] of [
+    ["with default: {}", { default: {} }],
+    ["without a default", {}],
+  ] as const) {
+    it(`derives the value at construction and validates (${label})`, async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const doc: any = new (summaryModel(options))(input);
+      expect(doc.summary.claims.total).toBe(20);
+      expect(doc.summary.incentives.commission).toBe(40);
+      await expect(doc.validate()).resolves.toBeUndefined();
+      expect(doc.summary.incentives.commission).toBe(40);
+      expect(warn).not.toHaveBeenCalled();
+      warn.mockRestore();
+    });
+  }
+
+  it("constructs with the container from its default alone", async () => {
+    const doc: any = new (summaryModel())({ rate: 0.5 });
+    expect(doc.summary.incentives.commission).toBe(0);
+    await expect(doc.validate()).resolves.toBeUndefined();
+    expect(doc.summary.incentives.commission).toBe(0);
+  });
+
+  it("updates the value when a source changes on a new document", () => {
+    const doc: any = new (summaryModel())(input);
+    doc.summary.collected = 200;
+    expect(doc.summary.incentives.commission).toBe(90);
+    doc.rate = 1;
+    expect(doc.summary.incentives.commission).toBe(180);
+  });
+
+  it("derives the value when the container or the target's own subdocument is replaced", async () => {
+    const doc: any = new (summaryModel())(input);
+    doc.summary = { claims: { refund: 10 }, collected: 50 };
+    expect(doc.summary.incentives.commission).toBe(20);
+    doc.set("summary", { collected: 30 });
+    expect(doc.summary.incentives.commission).toBe(15);
+    doc.summary.incentives = {};
+    expect(doc.summary.incentives.commission).toBe(15);
+    await doc.validate();
+    expect(doc.summary.incentives.commission).toBe(15);
+  });
+
+  it("keeps a sibling target that chains off the container consistent when the container is assigned", async () => {
+    const periodSchema = new Schema(
+      {
+        total: {
+          default: 0,
+          derived: {
+            compute: (v: Record<string, unknown>) => Number(v["$root.summary.collected"] ?? 0) - Number(v["$root.summary.incentives.commission"] ?? 0),
+            sources: ["$root.summary.collected", "$root.summary.incentives.commission"],
+          },
+          type: Number,
+        },
+      },
+      { _id: false }
+    );
+    const incentivesSchema = new Schema(
+      { commission: { default: 0, derived: { compute: (v: Record<string, unknown>) => Number(v["$root.summary.collected"] ?? 0) * 0.4, sources: ["$root.summary.collected"] }, type: Number } },
+      { _id: false }
+    );
+    const summarySchema = new Schema({ collected: Number, incentives: { default: {}, type: incentivesSchema } }, { _id: false });
+    const schema = new Schema({ periodTotal: { default: {}, type: periodSchema }, summary: { default: {}, type: summarySchema } });
+    schema.plugin(derivedPaths);
+
+    const doc: any = new (uniqueModel(schema))({ summary: { collected: 100 } });
+    expect(doc.summary.incentives.commission).toBe(40);
+    expect(doc.periodTotal.total).toBe(60);
+    await doc.validate();
+    expect(doc.summary.incentives.commission).toBe(40);
+    expect(doc.periodTotal.total).toBe(60);
+  });
+
+  it("reads every source under an assigned container from the incoming value", () => {
+    const bucket = () => new Schema({ amount: Number, total: { default: 0, derived: { compute: add, sources: ["amount"] }, type: Number } }, { _id: false });
+    const periodSchema = new Schema(
+      {
+        total: {
+          default: 0,
+          derived: {
+            compute: (v: Record<string, unknown>) => Number(v["$root.summary.collected.total"] ?? 0) - Number(v["$root.summary.claims.total"] ?? 0),
+            sources: ["$root.summary.claims.total", "$root.summary.collected.total"],
+          },
+          type: Number,
+        },
+      },
+      { _id: false }
+    );
+    const summarySchema = new Schema({ claims: { default: {}, type: bucket() }, collected: { default: {}, type: bucket() } }, { _id: false });
+    const schema = new Schema({ periodTotal: { default: {}, type: periodSchema }, summary: { default: {}, type: summarySchema } });
+    schema.plugin(derivedPaths);
+
+    const doc: any = new (uniqueModel(schema))({ summary: { claims: { amount: 20 }, collected: { amount: 100 } } });
+    expect(doc.periodTotal.total).toBe(80);
+    doc.summary = { claims: { amount: 5 }, collected: { amount: 50 } };
+    expect(doc.periodTotal.total).toBe(45);
+  });
+
+  it("keeps a stored immutable target when hydrating", async () => {
+    const doc: any = summaryModel().hydrate({ rate: 0.5, summary: { claims: { refund: 20, total: 99 }, collected: 100, incentives: { commission: 7 } } });
+    expect(doc.summary.claims.total).toBe(99);
+    expect(doc.summary.incentives.commission).toBe(7);
+    doc.summary.claims.refund = 30;
+    expect(doc.summary.claims.total).toBe(99);
+  });
+
+  it("recomputes non-immutable targets on a loaded document", async () => {
+    const doc: any = summaryModel().hydrate({ rate: 0.5, summary: { claims: { refund: 20, total: 20 }, collected: 100, incentives: { commission: 7 } } });
+    doc.summary.collected = 200;
+    expect(doc.summary.incentives.commission).toBe(90);
+    doc.rate = 1;
+    await doc.validate();
+    expect(doc.summary.incentives.commission).toBe(180);
+  });
+
+  it("still creates a sibling target container that has no default when a source is assigned, as before", () => {
+    const periodSchema = new Schema(
+      { total: { derived: { compute: (v: Record<string, unknown>) => Number(v["$root.summary.collected"] ?? 0), sources: ["$root.summary.collected"] }, type: Number } },
+      { _id: false }
+    );
+    const schema = new Schema({ periodTotal: periodSchema, summary: { default: {}, type: new Schema({ collected: Number }, { _id: false }) } });
+    schema.plugin(derivedPaths);
+    const Model = uniqueModel(schema);
+
+    expect((new Model({ summary: { collected: 100 } }) as any).periodTotal?.total).toBe(100);
+    const doc: any = new Model();
+    doc.summary.collected = 50;
+    expect(doc.periodTotal?.total).toBe(50);
+  });
+
+  it("still creates a public derivedPath target's container that has no default", () => {
+    const schema = new Schema({ a: Number, nested: new Schema({ total: Number }, { _id: false }) });
+    schema.plugin(derivedPath, { compute: (v: Record<"a", unknown>) => Number(v.a ?? 0) * 2, sources: ["a"], target: "nested.total" });
+    const doc: any = new (uniqueModel(schema))({ a: 5 });
+    expect(doc.nested?.total).toBe(10);
+    doc.a = 7;
+    expect(doc.nested?.total).toBe(14);
+  });
+});

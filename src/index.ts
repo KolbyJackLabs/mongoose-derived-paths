@@ -41,7 +41,9 @@ export function derivedPath<Source extends string>(schema: Schema, { compute, so
   const readSources = (doc: DocumentLike, override?: Override<Source>) => {
     const values = {} as Record<Source, unknown>;
     for (const s of sources) {
-      values[s] = collect(doc, s.split("."), s === override?.source ? override : undefined);
+      // Every source under the path being assigned reads the incoming value, not just the one whose setter is running
+      const shared = override && pathPrefix(s, override.index) === pathPrefix(override.source, override.index);
+      values[s] = collect(doc, s.split("."), shared ? override : undefined);
     }
     return values;
   };
@@ -61,11 +63,15 @@ export function derivedPath<Source extends string>(schema: Schema, { compute, so
   };
 
   const targetDepth = resolvePath(schema, target)?.depth ?? 0;
+  // Subdocuments on the way to the target, e.g. "summary" and "summary.incentives" for "summary.incentives.commission"
+  const targetContainers = (resolvePath(schema, target)?.steps.slice(0, -1) ?? []).map(({ index }) => pathPrefix(target, index));
   const describe = `"${target}" is derived from ${sources.map((s) => `"${s}"`).join(", ")}`;
 
   // Only derivedPath writes a derived path: manual document assignments are replaced with the derived value, and
   // query updates that set it fail, since a setter can't drop a key from an update
   addSetter(targetType, `target:${target}`, function (this: unknown, value: unknown, priorVal: unknown, _schemaType: unknown, options?: { _skipMarkModified?: boolean }) {
+    // Written into an incoming container by a source setter below; already derived
+    if (value instanceof Derived) return value.value;
     // Mongoose applies defaults through setters with `_skipMarkModified`; those aren't manual sets
     if (computing || options?._skipMarkModified) return value;
 
@@ -82,6 +88,10 @@ export function derivedPath<Source extends string>(schema: Schema, { compute, so
   for (const { resolved, source } of resolvedSources) {
     // The leaf and every subdocument/array on the way to it: replacing any of them changes the source's value
     for (const { depth, index, schemaType } of resolved.steps) {
+      // Assigning a subdocument the target lives in replaces the target along with it
+      const replacesTarget = targetContainers.includes(pathPrefix(source, index));
+      // Target containers that also hold this source; creating one of them re-runs this setter
+      const sharedContainers = targetContainers.filter((path) => source.startsWith(`${path}.`));
       addSetter(schemaType, `source:${target}:${source}:${index}`, function (this: unknown, value: unknown) {
         // Setters also run on query updates, where `this` is the Query; only documents can recompute
         if (!isDocument(this)) return value;
@@ -89,12 +99,38 @@ export function derivedPath<Source extends string>(schema: Schema, { compute, so
         const doc = climb(this, depth);
         // Subdocument not attached yet (defaults while building); pre("validate") catches up
         if (!doc) return value;
-
+        // Another derived target written into this incoming container; read it as its plain value
+        const incoming = value instanceof Derived ? value.value : value;
         // Setters run before the value is stored, so read the incoming (cast) value in place of the stored one
-        recompute(doc as DocumentLike, { index, owner: this, source, value: castOrRaw(schemaType, value, this) });
+        const override: Override<Source> = { index, owner: this, source, value: castOrRaw(schemaType, incoming, this) };
+
+        if (replacesTarget) {
+          // Setting the target on the document now would write into the container being replaced (or create it, and
+          // re-run this setter until the stack overflows), so write it into the incoming value instead
+          const values = readSources(doc as DocumentLike, override);
+          if (!override.used) return value;
+          return withTarget(value, target.split(".").slice(index + 1), new Derived(compute(values)));
+        }
+        // A container holding this source and the target is still being cast; its own setter derives the target
+        if (sharedContainers.some((path) => (doc as DocumentLike).get(path) == null)) return value;
+
+        recompute(doc as DocumentLike, override);
         return value;
       });
     }
+  }
+
+  // A target container that holds none of the sources: assigning it brings the target's default (or a manual value), so
+  // write the derived value into the incoming container
+  for (const { depth, index, schemaType } of resolvePath(schema, target)?.steps.slice(0, -1) ?? []) {
+    const container = pathPrefix(target, index);
+    if (sources.some((source) => source.startsWith(`${container}.`))) continue;
+    addSetter(schemaType, `container:${target}:${index}`, function (this: unknown, value: unknown) {
+      if (!isDocument(this)) return value;
+      const doc = climb(this, depth);
+      if (!doc) return value;
+      return withTarget(value, target.split(".").slice(index + 1), new Derived(compute(readSources(doc as DocumentLike))));
+    });
   }
 
   schema.pre("validate", function () {
@@ -311,6 +347,31 @@ function collect(node: unknown, parts: string[], override?: Override, index = 0)
         ? (node as DocumentLike).get(parts[index])
         : (node as Record<string, unknown>)[parts[index]];
   return index === parts.length - 1 ? next : collect(next, parts, override, index + 1);
+}
+
+// A derived value written into an incoming container, so the target's setter takes it without a warning
+class Derived {
+  constructor(readonly value: unknown) {}
+}
+
+// Copies the plain-object `container` with `value` at `parts`, leaving the caller's object untouched. Anything else
+// (a document, null) is returned as is; pre("validate") derives the target once it's stored. A value already written
+// by an outer container's setter wins: setters on inner containers run while it's cast, before it's stored
+function withTarget(container: unknown, parts: string[], value: Derived): unknown {
+  if (!isPlainObject(container)) return container;
+  const [key, ...rest] = parts;
+  if (rest.length === 0 && container[key] instanceof Derived) return container;
+  const next = rest.length === 0 ? value : withTarget(container[key] ?? {}, rest, value);
+  return next === container[key] ? container : { ...container, [key]: next };
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value != null && Object.getPrototypeOf(value) === Object.prototype;
+}
+
+// `path` up to and including segment `index`
+function pathPrefix(path: string, index: number) {
+  return path.split(".").slice(0, index + 1).join(".");
 }
 
 function climb(doc: Document, depth: number) {
