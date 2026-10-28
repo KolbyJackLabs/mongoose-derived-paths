@@ -1,6 +1,6 @@
 {
   "name": "mongoose-derived-paths",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Mongoose plugin: declare a field's value as a function of other fields and keep it stored and in sync as they change",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
